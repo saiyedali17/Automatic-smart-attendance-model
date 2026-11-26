@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Attendance Portal</title>
+<style>
+:root{--maroon:#800000;--bg:#fff;--soft:#f4f1f1;--text:#222;--ok:#1a9d55;--bad:#d33}
+@media (prefers-color-scheme:dark){:root{--bg:#181414;--soft:#262020;--text:#eee}}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,Segoe UI,sans-serif;background:var(--bg);color:var(--text)}
+header{background:var(--maroon);color:#fff;padding:14px 16px;font-size:1.25rem;font-weight:700}
+nav{display:flex;gap:6px;padding:10px 16px;flex-wrap:wrap;border-bottom:1px solid var(--soft)}
+nav button{flex:1;min-width:120px;padding:10px;border:0;border-radius:8px;background:var(--soft);color:var(--text);font-weight:600;cursor:pointer}
+nav button.on{background:var(--maroon);color:#fff}
+main{max-width:760px;margin:0 auto;padding:16px}
+section{display:none}section.on{display:block}
+label{display:block;margin:10px 0 4px;font-weight:600}
+input{width:100%;padding:10px;border-radius:8px;border:1px solid #8886;background:var(--bg);color:var(--text);font-size:1rem}
+.btn{margin-top:12px;padding:11px 18px;border:0;border-radius:8px;background:var(--maroon);color:#fff;font-weight:700;cursor:pointer;font-size:1rem}
+.btn:disabled{opacity:.5}.btn.alt{background:#555}
+.cam{position:relative;margin-top:12px;background:#000;border-radius:10px;overflow:hidden;display:none}
+.cam video,.cam canvas{width:100%;display:block}.cam canvas{position:absolute;inset:0}
+.msg{margin-top:12px;padding:10px;border-radius:8px;background:var(--soft);min-height:2.4em}
+.ok{color:var(--ok)}.err{color:var(--bad)}
+table{width:100%;border-collapse:collapse;margin-top:12px}td,th{padding:8px;border-bottom:1px solid var(--soft);text-align:left}
+progress{width:100%;margin-top:10px}
+</style>
+</head>
+<body>
+<header>Smart Attendance Portal</header>
+<nav id="nav">
+  <button data-t="reg" class="on">Register</button>
+  <button data-t="att">Take Attendance</button>
+  <button data-t="view">View Attendance</button>
+</nav>
+<main>
+<section id="reg" class="on">
+  <h2>Register student</h2>
+  <label>Roll No. (digits only)</label><input id="roll" inputmode="numeric" pattern="\d*">
+  <label>Name</label><input id="name">
+  <button class="btn" id="startReg">Capture face images</button>
+  <button class="btn alt" id="train">Train model</button>
+  <div class="cam" id="regCam"><video id="regVid" playsinline muted></video><canvas id="regOv"></canvas></div>
+  <progress id="prog" max="40" value="0" hidden></progress>
+  <div class="msg" id="regMsg">Look at the camera, keep your face in frame and move your head slightly.</div>
+</section>
+
+<section id="att">
+  <h2>Take attendance</h2>
+  <label>Subject</label><input id="subject" placeholder="e.g. Maths">
+  <label>Duration (seconds)</label><input id="dur" type="number" value="20" min="5" max="300">
+  <button class="btn" id="startAtt">Start</button>
+  <button class="btn alt" id="stopAtt" disabled>Finish now</button>
+  <div class="cam" id="attCam"><video id="attVid" playsinline muted></video><canvas id="attOv"></canvas></div>
+  <div class="msg" id="attMsg">Train the model first, then start.</div>
+  <table id="presentTbl" hidden><thead><tr><th>Roll</th><th>Name</th></tr></thead><tbody></tbody></table>
+</section>
+
+<section id="view">
+  <h2>View attendance</h2>
+  <label>Subject</label><select id="subjSel" style="width:100%;padding:10px"></select>
+  <button class="btn" id="loadView">Show</button>
+  <a class="btn alt" id="dl" style="display:none;text-decoration:none;display:inline-block;margin-left:6px" href="#">Download CSV</a>
+  <table id="viewTbl"><thead></thead><tbody></tbody></table>
+</section>
+</main>
+
+<script>
+const $=id=>document.getElementById(id);
+const post=(u,b)=>fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(async r=>({status:r.status,...(await r.json())}));
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function say(el,t,cls){el.textContent=t;el.className='msg '+(cls||'')}
+
+// tabs
+document.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('#nav button,section').forEach(x=>x.classList.remove('on'));
+  b.classList.add('on');$(b.dataset.t).classList.add('on');
+  if(b.dataset.t==='view')loadSubjects();
+});
+
+async function openCam(vid,box){
+  if(!navigator.mediaDevices?.getUserMedia)throw new Error('Camera needs HTTPS (or localhost) and a supported browser.');
+  const s=await navigator.mediaDevices.getUserMedia({video:{width:640,height:480,facingMode:'user'},audio:false});
+  vid.srcObject=s;await vid.play();box.style.display='block';return s;
+}
+function closeCam(vid,box,s){s&&s.getTracks().forEach(t=>t.stop());vid.srcObject=null;box.style.display='none'}
+const grab=document.createElement('canvas');
+function frame(vid){grab.width=vid.videoWidth;grab.height=vid.videoHeight;grab.getContext('2d').drawImage(vid,0,0);return grab.toDataURL('image/jpeg',.8)}
+function draw(ov,vid,faces){
+  ov.width=vid.videoWidth;ov.height=vid.videoHeight;const c=ov.getContext('2d');c.clearRect(0,0,ov.width,ov.height);
+  c.lineWidth=3;c.font='bold 22px sans-serif';
+  faces.forEach(f=>{const[x,y,w,h]=f.box;c.strokeStyle=f.color||'#0f0';c.fillStyle=f.color||'#0f0';c.strokeRect(x,y,w,h);if(f.label)c.fillText(f.label,x,Math.max(20,y-6))})
+}
+
+// register
+let regBusy=false;
+$('startReg').onclick=async()=>{
+  if(regBusy)return;
+  const roll=$('roll').value.trim(),name=$('name').value.trim();
+  if(!/^\d+$/.test(roll)||!name)return say($('regMsg'),'Enter a numeric roll number and a name.','err');
+  regBusy=true;$('startReg').disabled=true;let s;
+  try{
+    s=await openCam($('regVid'),$('regCam'));$('prog').hidden=false;$('prog').value=0;
+    let saved=0;const TARGET=40;
+    while(saved<TARGET){
+      const r=await post('/api/register/frame',{roll,name,image:frame($('regVid'))});
+      if(!r.ok)throw new Error(r.error);
+      draw($('regOv'),$('regVid'),r.box?[{box:r.box}]:[]);
+      if(r.saved){saved++;$('prog').value=saved;say($('regMsg'),`Captured ${saved}/${TARGET}`)}
+      else say($('regMsg'),'No face detected - move closer / improve lighting.','err');
+      await sleep(150);
+    }
+    const f=await post('/api/register/finish',{roll,name});
+    if(!f.ok)throw new Error(f.error);
+    say($('regMsg'),`Saved ${TARGET} images for ${name}. Now click "Train model".`,'ok');
+  }catch(e){say($('regMsg'),e.message,'err')}
+  closeCam($('regVid'),$('regCam'),s);regBusy=false;$('startReg').disabled=false;
+};
+$('train').onclick=async()=>{
+  say($('regMsg'),'Training...');$('train').disabled=true;
+  const r=await post('/api/train',{});
+  $('train').disabled=false;
+  r.ok?say($('regMsg'),`Trained on ${r.images} images of ${r.students} student(s).`,'ok'):say($('regMsg'),r.error,'err');
+};
+
+// attendance
+let stopFlag=false;
+$('stopAtt').onclick=()=>stopFlag=true;
+$('startAtt').onclick=async()=>{
+  const subject=$('subject').value.trim(),dur=+$('dur').value||20;
+  if(!subject)return say($('attMsg'),'Enter a subject name.','err');
+  $('startAtt').disabled=true;$('stopAtt').disabled=false;stopFlag=false;
+  const present=new Map();$('presentTbl').hidden=false;const tb=$('presentTbl').tBodies[0];tb.innerHTML='';
+  let s;
+  try{
+    s=await openCam($('attVid'),$('attCam'));const end=Date.now()+dur*1000;
+    while(Date.now()<end&&!stopFlag){
+      const r=await post('/api/recognize',{image:frame($('attVid'))});
+      if(!r.ok)throw new Error(r.error);
+      draw($('attOv'),$('attVid'),r.faces.map(f=>({box:f.box,color:f.id?'#0f0':'#f33',label:f.id?`${f.id}-${f.name}`:'Unknown'})));
+      r.faces.forEach(f=>{if(f.id&&!present.has(f.id)){present.set(f.id,f.name);tb.insertAdjacentHTML('beforeend',`<tr><td>${f.id}</td><td></td></tr>`);tb.lastChild.cells[1].textContent=f.name}});
+      say($('attMsg'),`Scanning... ${Math.max(0,Math.ceil((end-Date.now())/1000))}s left, ${present.size} present`);
+      await sleep(100);
+    }
+    const sv=await post('/api/attendance/save',{subject,ids:[...present.keys()]});
+    if(!sv.ok)throw new Error(sv.error);
+    say($('attMsg'),`Attendance saved for ${subject}: ${sv.present} present.`,'ok');
+  }catch(e){say($('attMsg'),e.message,'err')}
+  closeCam($('attVid'),$('attCam'),s);$('startAtt').disabled=false;$('stopAtt').disabled=true;
+};
+
+// view
+async function loadSubjects(){
+  const l=await (await fetch('/api/subjects')).json();
+  $('subjSel').innerHTML=l.map(s=>`<option></option>`).join('');
+  [...$('subjSel').options].forEach((o,i)=>{o.value=o.textContent=l[i]});
+}
+$('loadView').onclick=async()=>{
+  const sub=$('subjSel').value;if(!sub)return;
+  const rows=await (await fetch('/api/attendance/'+encodeURIComponent(sub))).json();
+  const cols=['Session','Enrollment','Name','Date','Time'];
+  $('viewTbl').tHead.innerHTML='<tr>'+cols.map(c=>`<th>${c}</th>`).join('')+'</tr>';
+  const tb=$('viewTbl').tBodies[0];tb.innerHTML='';
+  rows.forEach(r=>{const tr=tb.insertRow();cols.forEach(c=>{tr.insertCell().textContent=r[c]??''})});
+  $('dl').style.display='inline-block';$('dl').href='/api/attendance/'+encodeURIComponent(sub)+'/download';
+};
+</script>
+</body>
+</html>
